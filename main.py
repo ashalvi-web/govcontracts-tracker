@@ -2,6 +2,7 @@ import requests
 import time
 import json
 import os
+import re
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
@@ -14,10 +15,10 @@ TELEGRAM_CHAT_ID  = os.environ['TELEGRAM_CHAT_ID']
 GOOGLE_SHEET_ID   = os.environ['GOOGLE_SHEET_ID']
 GOOGLE_CREDS_JSON = os.environ['GOOGLE_CREDS_JSON']
 
-MIN_CONTRACT_AMOUNT = 50_000_000   # $50M מינימום
-MIN_PCT_REVENUE     = 5.0          # לפחות 5% מהמחזור השנתי
-MIN_PCT_MKTCAP      = 3.0          # לפחות 3% משווי השוק
-DAYS_BACK           = 1            # כמה ימים אחורה
+MIN_CONTRACT_AMOUNT = 50_000_000
+MIN_PCT_REVENUE     = 5.0
+MIN_PCT_MKTCAP      = 3.0
+DAYS_BACK           = 1
 
 # ============================================================
 # Telegram
@@ -50,7 +51,7 @@ def save_to_sheet(rows):
         gc = gspread.authorize(creds)
         ws = gc.open_by_key(GOOGLE_SHEET_ID).get_worksheet(0)
         ws.append_rows(rows)
-        print(f"✅ {len(rows)} שורות נשמרו ב-Sheet")
+        print(f"✅ {len(rows)} שורות נשמרו")
     except Exception as e:
         print(f"⚠️ שגיאת Sheet: {e}")
 
@@ -58,16 +59,11 @@ def save_to_sheet(rows):
 # זיהוי טיקר אוטומטי
 # ============================================================
 def find_ticker(company_name):
-    """
-    מחפש טיקר בורסאי לכל חברה דרך Yahoo Finance
-    """
-    # ניקוי שם החברה
     clean = company_name.upper()
     for word in [",", ".", "LLC", "INC", "CORP", "CO",
                  "LTD", "LP", "THE ", "&", "  "]:
         clean = clean.replace(word, " ")
     clean = clean.strip()
-
     try:
         url = (f"https://query2.finance.yahoo.com/v1/finance/search"
                f"?q={requests.utils.quote(clean)}&limit=5&type=equity")
@@ -76,7 +72,6 @@ def find_ticker(company_name):
             return None
         quotes = r.json().get('quotes', [])
         for q in quotes:
-            # רק מניות אמריקאיות בבורסות מרכזיות
             if q.get('exchange') in ['NMS', 'NYQ', 'NGM', 'ASE', 'PCX']:
                 return q.get('symbol')
     except:
@@ -87,75 +82,52 @@ def find_ticker(company_name):
 # מידע פיננסי
 # ============================================================
 def get_financials(ticker):
-    """
-    שולף מחזור שנתי ושווי שוק מ-Yahoo Finance
-    """
     if not ticker:
         return None, None
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info
-        revenue    = info.get('totalRevenue', 0) or 0
-        market_cap = info.get('marketCap', 0) or 0
-        return revenue, market_cap
+        return info.get('totalRevenue', 0) or 0, info.get('marketCap', 0) or 0
     except:
         return None, None
 
 # ============================================================
-# קריטריון — האם החוזה מעניין?
+# האם החוזה מעניין?
 # ============================================================
 def is_interesting(amount, revenue, market_cap):
-    """
-    מחזיר (True/False, סיבה)
-    """
     if revenue and revenue > 0:
-        pct_rev = (amount / revenue) * 100
-        if pct_rev >= MIN_PCT_REVENUE:
-            return True, f"{pct_rev:.1f}% מהמחזור השנתי"
-
+        pct = (amount / revenue) * 100
+        if pct >= MIN_PCT_REVENUE:
+            return True, f"{pct:.1f}% מהמחזור השנתי"
     if market_cap and market_cap > 0:
-        pct_mc = (amount / market_cap) * 100
-        if pct_mc >= MIN_PCT_MKTCAP:
-            return True, f"{pct_mc:.1f}% משווי השוק"
-
+        pct = (amount / market_cap) * 100
+        if pct >= MIN_PCT_MKTCAP:
+            return True, f"{pct:.1f}% משווי השוק"
     return False, None
 
 # ============================================================
-# שאיבת חוזים מ-USAspending
+# מקור 1: USAspending API
 # ============================================================
-def fetch_contracts():
+def fetch_usaspending():
     end_date   = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=DAYS_BACK + 3)).strftime("%Y-%m-%d")
-
     payload = {
         "filters": {
             "time_period": [{"start_date": start_date, "end_date": end_date}],
             "award_type_codes": ["A", "B", "C", "D"],
-            "award_amounts": [{
-                "lower_bound": MIN_CONTRACT_AMOUNT,
-                "upper_bound": 10_000_000_000
-            }],
+            "award_amounts": [{"lower_bound": MIN_CONTRACT_AMOUNT,
+                               "upper_bound": 10_000_000_000}],
             "agencies": [
-                {"type": "awarding", "tier": "toptier",
-                 "name": "Department of Defense"},
-                {"type": "awarding", "tier": "toptier",
-                 "name": "National Aeronautics and Space Administration"},
-                {"type": "awarding", "tier": "toptier",
-                 "name": "Department of Homeland Security"},
-                {"type": "awarding", "tier": "toptier",
-                 "name": "Department of Energy"}
+                {"type": "awarding", "tier": "toptier", "name": "Department of Defense"},
+                {"type": "awarding", "tier": "toptier", "name": "National Aeronautics and Space Administration"},
+                {"type": "awarding", "tier": "toptier", "name": "Department of Homeland Security"},
+                {"type": "awarding", "tier": "toptier", "name": "Department of Energy"}
             ]
         },
-        "fields": [
-            "Award ID", "Recipient Name", "Award Amount",
-            "Start Date", "Awarding Agency", "Description"
-        ],
-        "sort": "Award Amount",
-        "order": "desc",
-        "limit": 100,
-        "page": 1
+        "fields": ["Award ID","Recipient Name","Award Amount",
+                   "Start Date","Awarding Agency","Description"],
+        "sort": "Award Amount", "order": "desc", "limit": 100, "page": 1
     }
-
     try:
         r = requests.post(
             "https://api.usaspending.gov/api/v2/search/spending_by_award/",
@@ -163,133 +135,168 @@ def fetch_contracts():
         )
         if r.status_code == 200:
             results = r.json().get('results', [])
-            print(f"✅ נמצאו {len(results)} חוזים מ-USAspending")
-            return results
-        print(f"❌ API error: {r.status_code}")
-        return []
+            print(f"✅ USAspending: {len(results)} חוזים")
+            return [{"source": "USAspending",
+                     "name": c.get("Recipient Name",""),
+                     "amount": float(c.get("Award Amount",0) or 0),
+                     "desc": str(c.get("Description",""))[:250],
+                     "agency": str(c.get("Awarding Agency","")),
+                     "id": str(c.get("Award ID","")),
+                     "date": str(c.get("Start Date",""))} for c in results]
     except Exception as e:
-        print(f"❌ שגיאה: {e}")
-        return []
+        print(f"❌ USAspending שגיאה: {e}")
+    return []
+
+# ============================================================
+# מקור 2: defense.gov/contracts (הכי מהיר!)
+# ============================================================
+def fetch_defense_gov():
+    contracts = []
+    for i in range(DAYS_BACK + 1):
+        date = datetime.now() - timedelta(days=i)
+        url = f"https://www.defense.gov/News/Contracts/Date/{date.strftime('%Y/%m/%d')}/"
+        try:
+            r = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code != 200:
+                continue
+            # פרסור paragraphs
+            paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', r.text, re.DOTALL)
+            for p in paragraphs:
+                text = re.sub('<[^<]+?>', '', p).strip()
+                if len(text) < 100:
+                    continue
+                # חיפוש סכום בטקסט ($X million / $X,XXX,XXX)
+                amounts = re.findall(
+                    r'\$[\d,]+(?:\.\d+)?\s*(?:million|billion)?', text, re.I
+                )
+                amount = 0
+                for a in amounts:
+                    num = re.sub(r'[^\d.]', '', a.split('$')[1])
+                    try:
+                        val = float(num)
+                        if 'billion' in a.lower():
+                            val *= 1_000_000_000
+                        elif 'million' in a.lower():
+                            val *= 1_000_000
+                        if val > amount:
+                            amount = val
+                    except:
+                        pass
+                if amount < MIN_CONTRACT_AMOUNT:
+                    continue
+                # חיפוש שם חברה (בדרך כלל לפני הפסיק הראשון)
+                company = text.split(',')[0].strip()[:80]
+                contracts.append({
+                    "source": "defense.gov",
+                    "name": company,
+                    "amount": amount,
+                    "desc": text[:250],
+                    "agency": "Department of Defense",
+                    "id": f"DOD-{date.strftime('%Y%m%d')}-{len(contracts)}",
+                    "date": date.strftime("%Y-%m-%d")
+                })
+        except Exception as e:
+            print(f"⚠️ defense.gov שגיאה ל-{date.strftime('%Y-%m-%d')}: {e}")
+    print(f"✅ defense.gov: {len(contracts)} חוזים")
+    return contracts
+
+# ============================================================
+# מקור 3: FPDS (Federal Procurement Data System)
+# ============================================================
+def fetch_fpds():
+    contracts = []
+    try:
+        end_date   = datetime.now().strftime("%Y/%m/%d")
+        start_date = (datetime.now() - timedelta(days=DAYS_BACK+2)).strftime("%Y/%m/%d")
+        url = (
+            f"https://www.fpds.gov/ezsearch/fpdsportal?q="
+            f"SIGNED_DATE:[{start_date},{end_date}]"
+            f"+DOLLARS_OBLIGATED:[{MIN_CONTRACT_AMOUNT},]"
+            f"&rss=1&start=0&end=50"
+        )
+        r = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code == 200:
+            items = re.findall(r'<item>(.*?)</item>', r.text, re.DOTALL)
+            for item in items:
+                title = re.search(r'<title>(.*?)</title>', item)
+                desc  = re.search(r'<description>(.*?)</description>', item)
+                title_text = re.sub('<[^<]+?>', '', title.group(1) if title else '')
+                desc_text  = re.sub('<[^<]+?>', '', desc.group(1)  if desc  else '')
+
+                amounts = re.findall(r'\$([\d,]+(?:\.\d+)?)', title_text + desc_text)
+                amount = 0
+                for a in amounts:
+                    try:
+                        val = float(a.replace(',',''))
+                        if val > amount:
+                            amount = val
+                    except:
+                        pass
+                if amount < MIN_CONTRACT_AMOUNT:
+                    continue
+                company = title_text.split('--')[0].strip()[:80] if '--' in title_text else title_text[:80]
+                contracts.append({
+                    "source": "FPDS",
+                    "name": company,
+                    "amount": amount,
+                    "desc": desc_text[:250],
+                    "agency": "Department of Defense",
+                    "id": f"FPDS-{len(contracts)}",
+                    "date": datetime.now().strftime("%Y-%m-%d")
+                })
+    except Exception as e:
+        print(f"⚠️ FPDS שגיאה: {e}")
+    print(f"✅ FPDS: {len(contracts)} חוזים")
+    return contracts
 
 # ============================================================
 # ניתוח וסינון
 # ============================================================
 def analyze(contracts):
-    alerts     = []
-    sheet_rows = []
-    skipped    = 0
+    seen = set()
+    alerts, sheet_rows = [], []
 
     for c in contracts:
-        name   = str(c.get('Recipient Name', ''))
-        amount = float(c.get('Award Amount', 0) or 0)
-        desc   = str(c.get('Description', ''))[:250]
-        agency = str(c.get('Awarding Agency', ''))
-        aid    = str(c.get('Award ID', ''))
-        date   = str(c.get('Start Date', ''))
+        name   = c['name']
+        amount = c['amount']
+
+        # מניעת כפילויות
+        key = f"{name[:30]}_{int(amount/1e6)}"
+        if key in seen:
+            continue
+        seen.add(key)
 
         if amount < MIN_CONTRACT_AMOUNT:
             continue
 
-        print(f"  🔍 בודק: {name} — ${amount:,.0f}")
+        print(f"  🔍 [{c['source']}] {name} — ${amount:,.0f}")
 
-        # שלב 1: חיפוש טיקר אוטומטי
         ticker = find_ticker(name)
-        time.sleep(0.5)  # נימוס ל-Yahoo
+        time.sleep(0.5)
 
         if not ticker:
-            # חברה לא בורסאית — לא מעניינת
-            print(f"     ❌ לא בורסאית — מדלג")
-            skipped += 1
+            print(f"     ❌ לא בורסאית")
             continue
 
-        # שלב 2: שליפת נתונים פיננסיים
         revenue, market_cap = get_financials(ticker)
-
-        # שלב 3: האם החוזה מהותי מספיק?
         interesting, reason = is_interesting(amount, revenue, market_cap)
 
         if not interesting:
-            print(f"     ⚠️ {ticker} — חוזה לא מהותי מספיק")
-            # שמור ב-Sheet בכל זאת — אבל ללא התראה
+            print(f"     ⚠️ {ticker} — לא מהותי")
             sheet_rows.append([
                 datetime.now().strftime("%Y-%m-%d %H:%M"),
-                name, ticker, amount, agency, date,
-                desc[:200], aid, "", market_cap or "", revenue or "",
-                "לא מהותי"
+                name, ticker, amount, c['agency'], c['date'],
+                c['desc'], c['id'], "", market_cap or "", revenue or "",
+                "לא מהותי", c['source']
             ])
             continue
 
         print(f"     ✅ {ticker} — {reason} — שולח התראה!")
 
-        # שלב 4: בניית הודעת Telegram
         pct_rev = round((amount/revenue*100), 1) if revenue else None
         pct_mc  = round((amount/market_cap*100), 1) if market_cap else None
 
+        source_emoji = {"USAspending": "🏛️", "defense.gov": "⚡", "FPDS": "📋"}.get(c['source'], "📄")
+
         msg = (
-            f"🚨 <b>חוזה ממשלתי מהותי!</b>\n\n"
-            f"🏢 <b>חברה:</b> {name}\n"
-            f"📋 <b>טיקר:</b> <b>{ticker}</b>\n"
-            f"💰 <b>סכום החוזה:</b> ${amount:,.0f}\n"
-            f"🏛️ <b>סוכנות:</b> {agency}\n"
-            f"📅 <b>תאריך:</b> {date}\n"
-        )
-        if pct_rev:
-            msg += f"📊 <b>% מהמחזור:</b> {pct_rev}%\n"
-        if pct_mc:
-            msg += f"📈 <b>% משווי שוק:</b> {pct_mc}%\n"
-        if revenue:
-            msg += f"💼 <b>מחזור שנתי:</b> ${revenue:,.0f}\n"
-        if market_cap:
-            msg += f"🏦 <b>שווי שוק:</b> ${market_cap:,.0f}\n"
-        msg += (
-            f"📝 <b>תיאור:</b> {desc}\n\n"
-            f"⚡ <b>סיבת ההתראה:</b> {reason}\n"
-            f"🔗 https://www.usaspending.gov/award/{aid}"
-        )
-
-        alerts.append(msg)
-        sheet_rows.append([
-            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            name, ticker, amount, agency, date,
-            desc[:200], aid, pct_rev or "", market_cap or "",
-            revenue or "", reason
-        ])
-
-    print(f"\n📊 סיכום: {len(alerts)} התראות, {skipped} לא בורסאיות")
-    return alerts, sheet_rows
-
-# ============================================================
-# MAIN
-# ============================================================
-def main():
-    print(f"\n{'='*50}")
-    print(f"🚀 GovContracts Tracker — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"{'='*50}\n")
-
-    contracts = fetch_contracts()
-
-    if not contracts:
-        send_telegram("⚠️ GovContracts: לא הצלחתי לשלוף נתונים מ-USAspending")
-        return
-
-    alerts, sheet_rows = analyze(contracts)
-
-    if sheet_rows:
-        save_to_sheet(sheet_rows)
-
-    for alert in alerts:
-        send_telegram(alert)
-        time.sleep(1)
-
-    summary = (
-        f"✅ סריקה יומית הסתיימה\n"
-        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"📊 חוזים שנסרקו: {len(contracts)}\n"
-        f"🚨 התראות שנשלחו: {len(alerts)}\n"
-        f"💾 שורות ב-Sheet: {len(sheet_rows)}"
-    )
-    send_telegram(summary)
-    print(summary)
-
-if __name__ == "__main__":
-    main()
+            f"🚨 <b>חוזה ממשלתי מהותי!</b> {source_emoji
